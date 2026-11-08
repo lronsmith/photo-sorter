@@ -1,12 +1,14 @@
 //! The review session: which file is current and what was decided for each.
 //!
-//! Pure state machine (no UI); the egui app drives it with key presses.
+//! State machine (no UI); the egui app drives it with key presses. Decisions
+//! that move a file are split into begin / run / finish so the move can run
+//! off the UI thread.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::dates::resolve_taken;
-use crate::fileops::{KeptRecord, keep_file, unkeep_file};
+use crate::fileops::{KeepOutcome, KeptRecord, keep_file, unkeep_file};
 use crate::keptlist::KeptList;
 use crate::media::MediaItem;
 use crate::skiplist::SkipList;
@@ -25,6 +27,59 @@ pub enum Message {
     None,
     Error(String),
     Warning(String),
+}
+
+/// What starting a decision produced.
+pub enum Step {
+    /// The decision is complete (nothing had to move).
+    Finished(Message),
+    /// A file has to move first: run the job, then call [`Session::finish`].
+    Pending(FileJob),
+}
+
+/// The file move behind a keep or an undo. Owns everything it needs, so it
+/// can run on another thread.
+pub struct FileJob {
+    idx: usize,
+    op: FileOp,
+}
+
+enum FileOp {
+    Keep {
+        src: PathBuf,
+        keep_dir: PathBuf,
+        taken: Option<i64>,
+    },
+    Unkeep(KeptRecord),
+}
+
+/// A finished [`FileJob`], to hand to [`Session::finish`].
+pub struct FileJobDone {
+    idx: usize,
+    result: JobResult,
+}
+
+enum JobResult {
+    Keep(io::Result<KeepOutcome>),
+    Unkeep(io::Result<Option<String>>),
+}
+
+impl FileJob {
+    /// Does the file I/O. A large cross-drive move can take minutes.
+    pub fn run(self) -> FileJobDone {
+        let result = match self.op {
+            FileOp::Keep {
+                src,
+                keep_dir,
+                taken,
+            } => JobResult::Keep(keep_file(&src, &keep_dir, taken)),
+            FileOp::Unkeep(record) => JobResult::Unkeep(unkeep_file(&record)),
+        };
+        FileJobDone {
+            idx: self.idx,
+            result,
+        }
+    }
 }
 
 struct Entry {
@@ -122,44 +177,60 @@ impl Session {
             .get_or_insert_with(|| resolve_taken(&entry.item.abs_path, entry.item.kind))
     }
 
-    /// Y: keep the current item (undoing a skip), then advance.
+    /// Y: keep the current item (undoing a skip), then advance. Runs any file
+    /// move on the calling thread; see [`Session::begin_keep`] to run it elsewhere.
     pub fn keep_current(&mut self) -> Message {
+        let step = self.begin_keep();
+        self.run_inline(step)
+    }
+
+    /// N: skip the current item (undoing a keep), then advance. Runs any file
+    /// move on the calling thread; see [`Session::begin_skip`] to run it elsewhere.
+    pub fn skip_current(&mut self) -> Message {
+        let step = self.begin_skip();
+        self.run_inline(step)
+    }
+
+    fn run_inline(&mut self, step: Step) -> Message {
+        match step {
+            Step::Finished(message) => message,
+            Step::Pending(job) => self.finish(job.run()),
+        }
+    }
+
+    /// Starts Y on the current item. If a file has to move, returns the job
+    /// without changing the session: run it (on any thread) and pass the
+    /// result to [`Session::finish`], calling nothing else that changes the
+    /// session in between.
+    pub fn begin_keep(&mut self) -> Step {
         if self.is_done() {
-            return Message::None;
+            return Step::Finished(Message::None);
         }
         let idx = self.cursor;
         if matches!(self.entries[idx].status, Status::Kept(_)) {
             self.next();
-            return Message::None;
+            return Step::Finished(Message::None);
         }
         // Resolve before moving: the sidecar/EXIF lookup needs the original path.
         let taken = self.taken(idx);
-        let entry = &mut self.entries[idx];
-        let outcome = match keep_file(&entry.item.abs_path, &self.keep_dir, taken) {
-            Ok(outcome) => outcome,
-            Err(e) => return Message::Error(format!("Couldn't keep file: {e}")),
-        };
-        let was_skipped = entry.status == Status::Skipped;
-        entry.status = Status::Kept(outcome.record);
-
-        let mut warnings = Vec::new();
-        if was_skipped && let Err(e) = self.skiplist.remove(&entry.item.rel_path) {
-            warnings.push(skiplist_warning(e));
-        }
-        if let Err(e) = self.keptlist.add(&entry.item.dup_key()) {
-            warnings.push(keptlist_warning(e));
-        }
-        warnings.extend(outcome.warning);
-        self.next();
-        message_from(warnings)
+        Step::Pending(FileJob {
+            idx,
+            op: FileOp::Keep {
+                src: self.entries[idx].item.abs_path.clone(),
+                keep_dir: self.keep_dir.clone(),
+                taken,
+            },
+        })
     }
 
-    /// N: skip the current item (undoing a keep), then advance.
-    pub fn skip_current(&mut self) -> Message {
+    /// Starts N on the current item. A plain skip finishes at once; undoing a
+    /// keep returns a job, as for [`Session::begin_keep`].
+    pub fn begin_skip(&mut self) -> Step {
         if self.is_done() {
-            return Message::None;
+            return Step::Finished(Message::None);
         }
-        let entry = &mut self.entries[self.cursor];
+        let idx = self.cursor;
+        let entry = &mut self.entries[idx];
         let mut warnings = Vec::new();
         match &entry.status {
             Status::Skipped => {}
@@ -170,15 +241,46 @@ impl Session {
                 }
             }
             Status::Kept(rec) => {
-                let restore_warning = match unkeep_file(rec) {
-                    Ok(warning) => warning,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        return Message::Error(
-                            "Can't undo: a file already exists at the original location".into(),
-                        );
-                    }
-                    Err(e) => return Message::Error(format!("Couldn't undo keep: {e}")),
-                };
+                return Step::Pending(FileJob {
+                    idx,
+                    op: FileOp::Unkeep(rec.clone()),
+                });
+            }
+        }
+        self.next();
+        Step::Finished(message_from(warnings))
+    }
+
+    /// Records the outcome of a job from [`Session::begin_keep`] or
+    /// [`Session::begin_skip`]. On success the item becomes Kept / Skipped and
+    /// the cursor moves past it; on failure nothing changes and an error is
+    /// returned.
+    pub fn finish(&mut self, done: FileJobDone) -> Message {
+        let idx = done.idx;
+        let entry = &mut self.entries[idx];
+        let mut warnings = Vec::new();
+        match done.result {
+            JobResult::Keep(Err(e)) => return Message::Error(format!("Couldn't keep file: {e}")),
+            JobResult::Keep(Ok(outcome)) => {
+                let was_skipped = entry.status == Status::Skipped;
+                entry.status = Status::Kept(outcome.record);
+                if was_skipped && let Err(e) = self.skiplist.remove(&entry.item.rel_path) {
+                    warnings.push(skiplist_warning(e));
+                }
+                if let Err(e) = self.keptlist.add(&entry.item.dup_key()) {
+                    warnings.push(keptlist_warning(e));
+                }
+                warnings.extend(outcome.warning);
+            }
+            JobResult::Unkeep(Err(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Message::Error(
+                    "Can't undo: a file already exists at the original location".into(),
+                );
+            }
+            JobResult::Unkeep(Err(e)) => {
+                return Message::Error(format!("Couldn't undo keep: {e}"));
+            }
+            JobResult::Unkeep(Ok(restore_warning)) => {
                 entry.status = Status::Skipped;
                 if let Err(e) = self.skiplist.add(&entry.item.rel_path) {
                     warnings.push(skiplist_warning(e));
@@ -189,7 +291,7 @@ impl Session {
                 warnings.extend(restore_warning);
             }
         }
-        self.next();
+        self.cursor = (idx + 1).min(self.entries.len());
         message_from(warnings)
     }
 
@@ -341,6 +443,38 @@ mod tests {
         assert_eq!(s.path_of(0), dest.as_path());
         assert_eq!(s.path_of(1), f.items[1].abs_path.as_path());
         assert_eq!(s.item(0), &f.items[0]);
+    }
+
+    #[test]
+    fn begin_then_finish_off_thread() {
+        let f = fixture(&["a.jpg", "b.jpg"]);
+        let mut s = f.session();
+        let Step::Pending(job) = s.begin_keep() else {
+            panic!("keep should need a file move");
+        };
+        // Nothing has happened yet.
+        assert!(f.items[0].abs_path.exists());
+        assert_eq!(s.status(0), &Status::Undecided);
+        assert_eq!(s.cursor(), 0);
+        let done = std::thread::spawn(move || job.run()).join().unwrap();
+        assert_eq!(s.finish(done), Message::None);
+        assert!(matches!(s.status(0), Status::Kept(_)));
+        assert!(!f.items[0].abs_path.exists());
+        assert_eq!(s.cursor(), 1);
+
+        // A plain skip needs no job; undoing the keep does.
+        assert!(matches!(s.begin_skip(), Step::Finished(Message::None)));
+        assert_eq!(s.status(1), &Status::Skipped);
+        s.prev();
+        s.prev();
+        let Step::Pending(job) = s.begin_skip() else {
+            panic!("undo should need a file move");
+        };
+        assert!(matches!(s.status(0), Status::Kept(_)));
+        assert_eq!(s.finish(job.run()), Message::None);
+        assert_eq!(s.status(0), &Status::Skipped);
+        assert!(f.items[0].abs_path.exists());
+        assert_eq!(s.cursor(), 1);
     }
 
     #[test]

@@ -44,6 +44,9 @@ keep it.
 - The JSON sidecar stays in the Takeout folder; only the photo or video moves.
 - Moving between drives copies the file, checks the copy's size, and only then
   removes the original. The app never deletes anything else.
+- While a file is being moved (a large video going to another drive can take a
+  while), the top bar shows "Moving…" and keys are ignored until it finishes.
+  Keys pressed during the move are thrown away, not applied afterwards.
 
 ## Resuming
 

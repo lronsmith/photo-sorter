@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2, pos2};
@@ -11,7 +12,7 @@ use super::{Action, action_for_key};
 use crate::dates::format_taken;
 use crate::media::MediaKind;
 use crate::preview::PreviewLoader;
-use crate::session::{Message, Session, Status};
+use crate::session::{FileJobDone, Message, Session, Status, Step};
 use crate::shell;
 
 const LEGEND: &str =
@@ -25,6 +26,17 @@ const KEEP_RADIUS: usize = 2;
 /// this bounds how many decodes the current item can be queued behind.
 const MAX_IN_FLIGHT: usize = 3;
 const WARNING_YELLOW: Color32 = Color32::from_rgb(230, 190, 40);
+const MOVING_TEXT: &str = "Moving…";
+/// How often to check whether a running file move has finished.
+const BUSY_POLL: Duration = Duration::from_millis(50);
+
+/// A keep/undo file move running on a worker thread.
+struct Busy {
+    rx: Receiver<FileJobDone>,
+    /// The item being moved and where its file was before.
+    idx: usize,
+    before: PathBuf,
+}
 
 pub(super) struct Review {
     session: Session,
@@ -36,6 +48,9 @@ pub(super) struct Review {
     /// (the file was kept/unkept meanwhile) is stale and dropped.
     in_flight: HashMap<usize, PathBuf>,
     message: Message,
+    /// `Some` while a file move runs. The session must not change meanwhile,
+    /// so every review key is ignored until it finishes.
+    busy: Option<Busy>,
 }
 
 impl Review {
@@ -46,6 +61,7 @@ impl Review {
             cache: HashMap::new(),
             in_flight: HashMap::new(),
             message: Message::None,
+            busy: None,
         }
     }
 
@@ -64,8 +80,18 @@ impl Review {
                 })
                 .collect()
         });
-        for action in actions {
-            self.apply(action);
+        // Keys collected this frame were pressed while a move was running if
+        // one was running at the end of the last frame, even if it has
+        // finished since: drop them too.
+        let was_busy = self.busy.is_some();
+        self.poll_busy();
+        for action in actions_to_apply(was_busy, actions) {
+            self.apply(ui.ctx(), action);
+        }
+        if self.busy.is_some() {
+            // The worker also requests a repaint when it finishes; this is a
+            // backstop in case that wake-up is missed.
+            ui.ctx().request_repaint_after(BUSY_POLL);
         }
         self.update_previews(ui.ctx());
 
@@ -80,10 +106,10 @@ impl Review {
         egui::CentralPanel::default().show(ui, |ui| self.centre(ui));
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
         self.message = match action {
-            Action::Keep => self.decide(Session::keep_current),
-            Action::Skip => self.decide(Session::skip_current),
+            Action::Keep => self.decide(ctx, Session::begin_keep),
+            Action::Skip => self.decide(ctx, Session::begin_skip),
             Action::Prev => {
                 self.session.prev();
                 Message::None
@@ -106,19 +132,60 @@ impl Review {
         };
     }
 
-    /// Runs a keep/skip on the current item; if that moved its file, drops
-    /// its cached preview so it is reloaded from the new location.
-    fn decide(&mut self, op: fn(&mut Session) -> Message) -> Message {
+    /// Starts a keep/skip on the current item. A decision that moves a file
+    /// runs on a worker thread and finishes in [`Review::poll_busy`].
+    fn decide(&mut self, ctx: &egui::Context, begin: fn(&mut Session) -> Step) -> Message {
         if self.session.is_done() {
             return Message::None;
         }
         let idx = self.session.cursor();
         let before = self.session.path_of(idx).to_path_buf();
-        let message = op(&mut self.session);
-        if self.session.path_of(idx) != before {
-            self.cache.remove(&idx);
+        let job = match begin(&mut self.session) {
+            Step::Finished(message) => return message,
+            Step::Pending(job) => job,
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("move".into())
+            .spawn(move || {
+                let _ = tx.send(job.run());
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.busy = Some(Busy { rx, idx, before });
+                Message::None
+            }
+            Err(e) => Message::Error(format!("Couldn't start moving the file: {e}")),
         }
-        message
+    }
+
+    /// Finishes the running file move, if it is done. If the item's file
+    /// moved, drops its cached preview so it is reloaded from the new place.
+    fn poll_busy(&mut self) {
+        let Some(busy) = &self.busy else {
+            return;
+        };
+        let result = match busy.rx.try_recv() {
+            Ok(done) => Ok(done),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(()),
+        };
+        let Some(busy) = self.busy.take() else {
+            return;
+        };
+        self.message = match result {
+            Ok(done) => self.session.finish(done),
+            // The worker died without reporting (a panic). The session is
+            // unchanged; the file may or may not have moved.
+            Err(()) => Message::Error(
+                "The file move stopped unexpectedly; check the source and keep folders".into(),
+            ),
+        };
+        if self.session.path_of(busy.idx) != busy.before {
+            self.cache.remove(&busy.idx);
+        }
     }
 
     /// Collects finished previews, requests the ones around the cursor, and
@@ -172,6 +239,11 @@ impl Review {
                 status
             );
             ui.label(egui::RichText::new(line).size(15.0));
+        }
+        if self.busy.is_some() {
+            ui.label(egui::RichText::new(MOVING_TEXT).size(15.0).strong());
+            ui.add_space(4.0);
+            return;
         }
         match &self.message {
             Message::None => {}
@@ -229,6 +301,25 @@ impl Review {
             }
         }
     }
+}
+
+/// Which of this frame's key actions to apply, in order. While a file move
+/// runs, none: those presses are discarded, not replayed later against items
+/// the user hasn't seen. Otherwise actions apply up to and including the first
+/// decision (Keep/Skip) and the rest are dropped, so a frame makes at most one
+/// decision and nothing is applied behind a move that has just started.
+fn actions_to_apply(busy: bool, actions: Vec<Action>) -> Vec<Action> {
+    if busy {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for action in actions {
+        out.push(action);
+        if matches!(action, Action::Keep | Action::Skip) {
+            break;
+        }
+    }
+    out
 }
 
 /// Which previews to request now, in order. The loader handles requests one
@@ -335,6 +426,30 @@ mod tests {
         let tall = fit_rect(Vec2::new(50.0, 100.0), area);
         assert_eq!(tall.size(), Vec2::new(50.0, 100.0));
         assert_eq!(tall.center(), area.center());
+    }
+
+    #[test]
+    fn busy_drops_every_action() {
+        use Action::*;
+        assert_eq!(
+            actions_to_apply(true, vec![Keep, Skip, Prev, Next, Open]),
+            Vec::<Action>::new()
+        );
+        assert_eq!(actions_to_apply(true, vec![]), Vec::<Action>::new());
+    }
+
+    #[test]
+    fn at_most_one_decision_per_frame() {
+        use Action::*;
+        assert_eq!(actions_to_apply(false, vec![Keep, Keep, Skip]), vec![Keep]);
+        assert_eq!(actions_to_apply(false, vec![Skip, Next]), vec![Skip]);
+        // Navigation before the decision still applies, in order.
+        assert_eq!(
+            actions_to_apply(false, vec![Next, Prev, Next, Keep, Prev]),
+            vec![Next, Prev, Next, Keep]
+        );
+        assert_eq!(actions_to_apply(false, vec![Open, Next]), vec![Open, Next]);
+        assert_eq!(actions_to_apply(false, vec![]), Vec::<Action>::new());
     }
 
     fn set(items: &[usize]) -> HashSet<usize> {
