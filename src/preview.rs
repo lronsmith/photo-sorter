@@ -2,6 +2,7 @@
 //! loader thread so the UI never blocks on disk or the shell.
 
 use std::collections::HashSet;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -27,7 +28,9 @@ const SHELL_THUMBNAIL_SIZE: u32 = 1600;
 /// shell thumbnail. Never larger than `MAX_EDGE` on its long edge.
 pub fn load_preview(path: &Path, kind: MediaKind) -> Option<image::RgbaImage> {
     let decoded = if kind == MediaKind::Image && is_decodable(path) {
-        decode(path)
+        // `image` decoders can panic on malformed files; treat that exactly
+        // like a decode error and fall back to the shell thumbnail.
+        catch_panic(|| decode(path)).flatten()
     } else {
         None
     };
@@ -60,6 +63,12 @@ fn decode(path: &Path) -> Option<DynamicImage> {
     Some(img)
 }
 
+/// Runs `f`, turning a panic into `None`.
+fn catch_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
+    // AssertUnwindSafe: on panic every value touched by `f` is discarded.
+    panic::catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
 fn downscale(img: DynamicImage) -> DynamicImage {
     if img.width().max(img.height()) > MAX_EDGE {
         img.resize(MAX_EDGE, MAX_EDGE, FilterType::Triangle)
@@ -81,6 +90,16 @@ pub struct PreviewLoader {
 
 impl PreviewLoader {
     pub fn new() -> PreviewLoader {
+        Self::with_loader(load_preview)
+    }
+
+    /// Builds a loader whose worker calls `load` for each request. Any panic
+    /// in `load` is caught and reported as `(idx, None)`, so one bad file can
+    /// never kill the worker (and with it every later preview).
+    fn with_loader<F>(load: F) -> PreviewLoader
+    where
+        F: Fn(&Path, MediaKind) -> Option<image::RgbaImage> + Send + 'static,
+    {
         let (request_tx, request_rx) = mpsc::channel::<(usize, PathBuf, MediaKind)>();
         let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
         std::thread::Builder::new()
@@ -90,7 +109,7 @@ impl PreviewLoader {
                 // thumbnail call doesn't load/unload COM.
                 let _com = shell::ComGuard::new();
                 for (idx, path, kind) in request_rx {
-                    let img = load_preview(&path, kind);
+                    let img = catch_panic(|| load(&path, kind)).flatten();
                     if result_tx.send((idx, img)).is_err() {
                         break;
                     }
@@ -166,8 +185,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.jpg");
         std::fs::write(&path, b"not an image").unwrap();
-        // Must not panic; a shell thumbnail (generic icon) or None are both fine.
-        let _ = load_preview(&path, MediaKind::Image);
+        // Decoding fails and the shell has no thumbnail for garbage bytes; with
+        // SIIGBF_THUMBNAILONLY it no longer substitutes the file-type icon.
+        assert!(load_preview(&path, MediaKind::Image).is_none());
     }
 
     #[test]
@@ -188,6 +208,49 @@ mod tests {
         let (idx, img) = got.expect("loader produced a result within 5 s");
         assert_eq!(idx, 3);
         assert_eq!(img.expect("decoded").dimensions(), (40, 20));
+    }
+
+    /// Polls until `n` results have arrived or 5 s pass.
+    fn collect(loader: &PreviewLoader, n: usize) -> Vec<(usize, Option<image::RgbaImage>)> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut results = Vec::new();
+        while results.len() < n && Instant::now() < deadline {
+            results.extend(loader.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        results
+    }
+
+    #[test]
+    fn catch_panic_turns_panic_into_none() {
+        assert_eq!(catch_panic(|| 5), Some(5));
+        assert_eq!(catch_panic(|| -> i32 { panic!("decoder blew up") }), None);
+    }
+
+    #[test]
+    fn loader_survives_panicking_load() {
+        let loader = PreviewLoader::with_loader(|path, _| {
+            if path.file_name().is_some_and(|n| n == "boom.gif") {
+                panic!("decoder blew up");
+            }
+            Some(image::RgbaImage::new(2, 2))
+        });
+        loader.request(0, PathBuf::from("boom.gif"), MediaKind::Image);
+        loader.request(1, PathBuf::from("fine.png"), MediaKind::Image);
+        let got: Vec<(usize, bool)> = collect(&loader, 2)
+            .into_iter()
+            .map(|(i, img)| (i, img.is_some()))
+            .collect();
+        assert_eq!(got, vec![(0, false), (1, true)]);
+
+        // The worker is still alive and the panicked index is no longer stuck.
+        loader.request(0, PathBuf::from("boom.gif"), MediaKind::Image);
+        loader.request(2, PathBuf::from("fine.png"), MediaKind::Image);
+        let got: Vec<(usize, bool)> = collect(&loader, 2)
+            .into_iter()
+            .map(|(i, img)| (i, img.is_some()))
+            .collect();
+        assert_eq!(got, vec![(0, false), (2, true)]);
     }
 
     #[test]

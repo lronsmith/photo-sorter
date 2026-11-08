@@ -14,7 +14,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT,
-    ShellExecuteW,
+    SIIGBF_THUMBNAILONLY, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, w};
@@ -74,7 +74,9 @@ pub fn open_default(path: &Path) -> std::io::Result<()> {
 /// Returns the Windows shell's thumbnail for `path`, scaled to fit a
 /// `size`×`size` box (with SIIGBF_BIGGERSIZEOK the shell may hand back a
 /// larger cached image, so callers that need a hard cap must enforce it).
-/// Any failure yields `None`.
+/// Only real thumbnails are returned (SIIGBF_THUMBNAILONLY): a file with no
+/// thumbnail yields `None` rather than its file-type icon, so the UI can show
+/// its "Preview unavailable" text. Any failure also yields `None`.
 pub fn shell_thumbnail(path: &Path, size: u32) -> Option<image::RgbaImage> {
     let _com = ComGuard::new();
     let edge = i32::try_from(size).ok()?;
@@ -86,7 +88,7 @@ pub fn shell_thumbnail(path: &Path, size: u32) -> Option<image::RgbaImage> {
     let hbitmap = unsafe {
         factory.GetImage(
             SIZE { cx: edge, cy: edge },
-            SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK,
+            SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY,
         )
     }
     .ok()?;
@@ -218,6 +220,15 @@ mod tests {
             close(p[0], 10) && close(p[1], 200) && close(p[2], 30) && p[3] == 255,
             "center pixel {p:?}"
         );
+    }
+
+    #[test]
+    fn shell_thumbnail_of_file_without_thumbnail_is_none() {
+        // Plain text has no thumbnail handler; we must not get its icon back.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(shell_thumbnail(&path, 256).is_none());
     }
 
     #[test]
