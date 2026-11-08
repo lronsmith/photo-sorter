@@ -1,8 +1,13 @@
 //! Keeping (moving) files into the keep folder and undoing that.
 
-use std::fs;
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::FileTimesExt;
 use std::path::{Path, PathBuf};
+
+use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+use windows::core::PCWSTR;
 
 use crate::dates::{Times, get_times, set_times, unix_to_system};
 
@@ -46,24 +51,75 @@ pub fn unique_dest(dir: &Path, file_name: &str) -> PathBuf {
 }
 
 /// Moves `src` to `dest`, falling back to copy-verify-delete across drives.
+/// Never replaces an existing `dest`: that fails with `AlreadyExists`.
 pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
-    match fs::rename(src, dest) {
+    match rename_no_replace(src, dest) {
         Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => copy_verify_delete(src, dest),
         other => other,
     }
 }
 
-/// Copies `src` to `dest`, checks the sizes match, then deletes `src`. On a
-/// size mismatch only the partial `dest` copy is removed; `src` is untouched.
+/// Same-volume rename via `MoveFileExW` with no flags: no replacing an
+/// existing destination and no implicit cross-volume copy.
+fn rename_no_replace(src: &Path, dest: &Path) -> io::Result<()> {
+    let src_w = to_wide(src);
+    let dest_w = to_wide(dest);
+    // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(src_w.as_ptr()),
+            PCWSTR(dest_w.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(win32_to_io)
+}
+
+fn to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// Turns a `HRESULT_FROM_WIN32` error back into an `io::Error` carrying the
+/// raw Win32 code, so `raw_os_error()` and `kind()` behave as for std calls.
+fn win32_to_io(e: windows::core::Error) -> io::Error {
+    let hr = e.code().0 as u32;
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((hr & 0xFFFF) as i32)
+    } else {
+        io::Error::other(e)
+    }
+}
+
+/// Copies `src` to a newly created `dest` (failing with `AlreadyExists`
+/// rather than overwriting), carries over its created/modified times, checks
+/// the sizes match, then deletes `src`. If anything fails after `dest` was
+/// created, only that copy is removed; `src` is never deleted on failure.
 pub fn copy_verify_delete(src: &Path, dest: &Path) -> io::Result<()> {
-    fs::copy(src, dest)?;
-    let src_len = fs::metadata(src)?.len();
-    let dest_len = fs::metadata(dest)?.len();
-    if src_len != dest_len {
-        // Best effort: the verification error matters more than a cleanup failure.
+    let source = File::open(src)?;
+    let target = OpenOptions::new().write(true).create_new(true).open(dest)?;
+    let result = copy_into_then_delete_source(source, target, src);
+    if result.is_err() {
+        // Best effort: the original error matters more than a cleanup failure.
         let _ = fs::remove_file(dest);
+    }
+    result
+}
+
+/// The part of [`copy_verify_delete`] after `dest` exists. Takes the handles by
+/// value so both are closed before the caller cleans up or `src` is removed.
+fn copy_into_then_delete_source(mut source: File, mut target: File, src: &Path) -> io::Result<()> {
+    let src_meta = source.metadata()?;
+    io::copy(&mut source, &mut target)?;
+    let times = FileTimes::new()
+        .set_modified(src_meta.modified()?)
+        .set_created(src_meta.created()?);
+    target.set_times(times)?;
+    target.sync_all()?;
+    if target.metadata()?.len() != src_meta.len() {
         return Err(io::Error::other("copy verification failed"));
     }
+    drop(source);
+    drop(target);
     fs::remove_file(src)
 }
 
@@ -269,6 +325,67 @@ mod tests {
         copy_verify_delete(&src, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"photo bytes");
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn move_file_refuses_existing_dest() {
+        let (_tmp, src, keep) = setup();
+        let dest = keep.join("IMG.jpg");
+        fs::write(&dest, b"existing").unwrap();
+        let err = move_file(&src, &dest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&src).unwrap(), b"photo bytes");
+        assert_eq!(fs::read(&dest).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn copy_verify_delete_refuses_existing_dest() {
+        let (_tmp, src, keep) = setup();
+        let dest = keep.join("IMG.jpg");
+        fs::write(&dest, b"existing").unwrap();
+        let err = copy_verify_delete(&src, &dest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&src).unwrap(), b"photo bytes");
+        assert_eq!(fs::read(&dest).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn copy_verify_delete_preserves_times() {
+        let (_tmp, src, keep) = setup();
+        let old = unix_to_system(1_400_000_000);
+        set_times(
+            &src,
+            Times {
+                created: old,
+                modified: old,
+            },
+        )
+        .unwrap();
+        let dest = keep.join("copy.jpg");
+        copy_verify_delete(&src, &dest).unwrap();
+        let times = get_times(&dest).unwrap();
+        assert_eq!(secs(times.created), 1_400_000_000);
+        assert_eq!(secs(times.modified), 1_400_000_000);
+    }
+
+    #[test]
+    fn copy_verify_delete_cleans_up_when_source_cannot_be_deleted() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let (_tmp, src, keep) = setup();
+        let dest = keep.join("copy.jpg");
+        // Held open without FILE_SHARE_DELETE, so deleting the source fails.
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&src)
+            .unwrap();
+        // Reading still works, so the failure below comes after the copy.
+        assert!(File::open(&src).is_ok());
+        assert!(copy_verify_delete(&src, &dest).is_err());
+        drop(holder);
+        assert_eq!(fs::read(&src).unwrap(), b"photo bytes");
+        assert!(!dest.exists());
     }
 
     #[test]
