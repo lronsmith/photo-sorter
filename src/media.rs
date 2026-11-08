@@ -23,6 +23,24 @@ pub struct MediaItem {
     pub size: u64,
 }
 
+impl MediaItem {
+    /// Identifies copies of the same photo: the lowercased file name, a tab,
+    /// then the size in bytes. Windows file names can't contain a tab, so the
+    /// encoding is unambiguous.
+    pub fn dup_key(&self) -> String {
+        dup_key(&self.abs_path, self.size)
+    }
+}
+
+/// See [`MediaItem::dup_key`].
+pub fn dup_key(path: &Path, size: u64) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    format!("{name}\t{size}")
+}
+
 /// Classifies a path by its (case-insensitive) extension.
 pub fn media_kind(path: &Path) -> Option<MediaKind> {
     let ext = path.extension()?.to_str()?.to_lowercase();
@@ -88,14 +106,7 @@ pub fn scan(
 
     items.sort_by_cached_key(|item| (item.rel_path.to_lowercase(), item.rel_path.clone()));
     let mut seen = HashSet::new();
-    items.retain(|item| {
-        let name = item
-            .abs_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        seen.insert((name, item.size))
-    });
+    items.retain(|item| seen.insert(item.dup_key()));
     Ok(items)
 }
 
@@ -192,6 +203,17 @@ mod tests {
             rel_paths(&items),
             ["Album/IMG_1.jpg", "Photos from 2019/IMG_1.jpg"]
         );
+    }
+
+    #[test]
+    fn dup_key_is_lowercased_name_tab_size() {
+        let item = MediaItem {
+            rel_path: "Album/IMG_1.JPG".into(),
+            abs_path: PathBuf::from(r"C:\src\Album\IMG_1.JPG"),
+            kind: MediaKind::Image,
+            size: 42,
+        };
+        assert_eq!(item.dup_key(), "img_1.jpg\t42");
     }
 
     #[test]

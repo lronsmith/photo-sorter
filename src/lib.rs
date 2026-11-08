@@ -1,6 +1,8 @@
 pub mod app;
 pub mod dates;
 pub mod fileops;
+pub mod keptlist;
+pub mod lineset;
 pub mod media;
 pub mod preview;
 pub mod session;

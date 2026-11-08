@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 
+use crate::keptlist::KeptList;
 use crate::media::{self, MediaItem};
 use crate::session::Session;
 use crate::skiplist::SkipList;
@@ -235,7 +236,8 @@ impl PhotoSorterApp {
             None => {}
             Some(Ok(items)) => {
                 let skiplist = SkipList::load(source);
-                let session = Session::new(items, keep.clone(), skiplist);
+                let keptlist = KeptList::load(source);
+                let session = Session::new(items, keep.clone(), skiplist, keptlist);
                 self.screen = Screen::Reviewing(Box::new(Review::new(session)));
             }
             Some(Err(e)) => {

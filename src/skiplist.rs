@@ -3,103 +3,46 @@
 //! UTF-8, one relative path (with `/` separators) per line. Lines for files
 //! that no longer exist are preserved untouched.
 
-use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::lineset::LineSet;
 
 pub const SKIP_FILE_NAME: &str = ".photo-sorter-skipped.txt";
 
 pub struct SkipList {
-    /// Full path of the skip file.
-    path: PathBuf,
-    /// Non-empty lines in file order (including stale entries), used when rewriting.
-    lines: Vec<String>,
-    /// Fast membership lookup over `lines`.
-    set: HashSet<String>,
-    /// The file on disk is non-empty and does not end with `\n`, so the next
-    /// append must start with a newline to avoid merging two entries.
-    needs_newline: bool,
+    lines: LineSet,
 }
 
 impl SkipList {
     /// Loads the skip list for `source`. A missing or unreadable file yields an empty list.
     pub fn load(source: &Path) -> SkipList {
-        let path = source.join(SKIP_FILE_NAME);
-        let content = fs::read(&path)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        let needs_newline = !content.is_empty() && !content.ends_with('\n');
-
-        let mut lines = Vec::new();
-        let mut set = HashSet::new();
-        for line in content.lines() {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() {
-                continue;
-            }
-            lines.push(line.to_string());
-            set.insert(line.to_string());
-        }
-
         SkipList {
-            path,
-            lines,
-            set,
-            needs_newline,
+            lines: LineSet::load(source.join(SKIP_FILE_NAME)),
         }
     }
 
     pub fn contains(&self, rel_path: &str) -> bool {
-        self.set.contains(rel_path)
+        self.lines.contains(rel_path)
     }
 
     /// Appends `rel_path` to the file. No-op if already present.
     /// In-memory state is updated even if the write fails.
     pub fn add(&mut self, rel_path: &str) -> std::io::Result<()> {
-        if !self.set.insert(rel_path.to_string()) {
-            return Ok(());
-        }
-        self.lines.push(rel_path.to_string());
-
-        let mut record = String::new();
-        if self.needs_newline {
-            record.push('\n');
-        }
-        record.push_str(rel_path);
-        record.push('\n');
-
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&self.path)?;
-        file.write_all(record.as_bytes())?;
-        self.needs_newline = false;
-        Ok(())
+        self.lines.add(rel_path)
     }
 
     /// Rewrites the file without `rel_path`. No-op if absent.
     /// In-memory state is updated even if the write fails.
     pub fn remove(&mut self, rel_path: &str) -> std::io::Result<()> {
-        if !self.set.remove(rel_path) {
-            return Ok(());
-        }
-        self.lines.retain(|line| line != rel_path);
-
-        let mut content = String::new();
-        for line in &self.lines {
-            content.push_str(line);
-            content.push('\n');
-        }
-        fs::write(&self.path, content)?;
-        self.needs_newline = false;
-        Ok(())
+        self.lines.remove(rel_path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn file_in(dir: &Path) -> PathBuf {
         dir.join(SKIP_FILE_NAME)

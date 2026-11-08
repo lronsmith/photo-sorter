@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::dates::resolve_taken;
 use crate::fileops::{KeptRecord, keep_file, unkeep_file};
+use crate::keptlist::KeptList;
 use crate::media::MediaItem;
 use crate::skiplist::SkipList;
 
@@ -38,12 +39,20 @@ pub struct Session {
     cursor: usize,
     keep_dir: PathBuf,
     skiplist: SkipList,
+    keptlist: KeptList,
 }
 
 impl Session {
-    pub fn new(items: Vec<MediaItem>, keep_dir: PathBuf, skiplist: SkipList) -> Session {
+    pub fn new(
+        items: Vec<MediaItem>,
+        keep_dir: PathBuf,
+        skiplist: SkipList,
+        keptlist: KeptList,
+    ) -> Session {
+        // Kept in an earlier session (this file or a copy of it): not offered again.
         let entries: Vec<Entry> = items
             .into_iter()
+            .filter(|item| !keptlist.contains(&item.dup_key()))
             .map(|item| {
                 let status = if skiplist.contains(&item.rel_path) {
                     Status::Skipped
@@ -66,6 +75,7 @@ impl Session {
             cursor,
             keep_dir,
             skiplist,
+            keptlist,
         }
     }
 
@@ -136,6 +146,9 @@ impl Session {
         if was_skipped && let Err(e) = self.skiplist.remove(&entry.item.rel_path) {
             warnings.push(skiplist_warning(e));
         }
+        if let Err(e) = self.keptlist.add(&entry.item.dup_key()) {
+            warnings.push(keptlist_warning(e));
+        }
         warnings.extend(outcome.warning);
         self.next();
         message_from(warnings)
@@ -170,6 +183,9 @@ impl Session {
                 if let Err(e) = self.skiplist.add(&entry.item.rel_path) {
                     warnings.push(skiplist_warning(e));
                 }
+                if let Err(e) = self.keptlist.remove(&entry.item.dup_key()) {
+                    warnings.push(keptlist_warning(e));
+                }
                 warnings.extend(restore_warning);
             }
         }
@@ -201,6 +217,10 @@ impl Session {
 
 fn skiplist_warning(e: io::Error) -> String {
     format!("Couldn't update skip list: {e}")
+}
+
+fn keptlist_warning(e: io::Error) -> String {
+    format!("Couldn't update kept list: {e}")
 }
 
 /// `Message::None`, or the warnings joined with `"; "`.
@@ -260,6 +280,7 @@ mod tests {
                 self.items.clone(),
                 self.keep.clone(),
                 SkipList::load(&self.source),
+                KeptList::load(&self.source),
             )
         }
 
@@ -466,6 +487,104 @@ mod tests {
         s.prev();
         s.skip_current();
         assert_eq!(s.counts(), (1, 2));
+    }
+
+    fn scan_source(f: &Fixture) -> Vec<MediaItem> {
+        crate::media::scan(&f.source, &f.keep, &mut |_| {}).unwrap()
+    }
+
+    fn session_for(f: &Fixture, items: Vec<MediaItem>) -> Session {
+        Session::new(
+            items,
+            f.keep.clone(),
+            SkipList::load(&f.source),
+            KeptList::load(&f.source),
+        )
+    }
+
+    /// Byte-identical copies in an album and a year folder, as Takeout has.
+    fn write_copies(f: &Fixture) {
+        for dir in ["Album X", "Photos from 2019"] {
+            fs::create_dir_all(f.source.join(dir)).unwrap();
+            fs::write(f.source.join(dir).join("IMG.jpg"), b"same bytes").unwrap();
+        }
+    }
+
+    #[test]
+    fn kept_copies_do_not_return_next_session() {
+        let f = fixture(&[]);
+        write_copies(&f);
+        let items = scan_source(&f);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].rel_path, "Album X/IMG.jpg");
+        let mut s = session_for(&f, items);
+        assert_eq!(s.keep_current(), Message::None);
+        assert!(KeptList::load(&f.source).contains("img.jpg\t10"));
+
+        // Next session: the year-folder copy is now unique on disk, but it
+        // is the photo already kept, so it must not be offered again.
+        let items = scan_source(&f);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].rel_path, "Photos from 2019/IMG.jpg");
+        let s = session_for(&f, items);
+        assert_eq!(s.len(), 0);
+        assert!(s.is_done());
+        assert_eq!(s.counts(), (0, 0));
+        assert!(f.source.join("Photos from 2019/IMG.jpg").exists());
+    }
+
+    #[test]
+    fn kept_items_excluded_at_startup() {
+        let f = fixture(&["a.jpg", "b.jpg"]);
+        KeptList::load(&f.source).add(&f.items[0].dup_key()).unwrap();
+        let s = f.session();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.cursor(), 0);
+        assert_eq!(s.current(), Some(&f.items[1]));
+    }
+
+    #[test]
+    fn undo_keep_removes_kept_key() {
+        let f = fixture(&[]);
+        write_copies(&f);
+        let mut s = session_for(&f, scan_source(&f));
+        s.keep_current();
+        s.prev();
+        assert_eq!(s.skip_current(), Message::None);
+        assert!(!KeptList::load(&f.source).contains("img.jpg\t10"));
+
+        // Next session: the album copy is back and remembered as skipped.
+        let items = scan_source(&f);
+        assert_eq!(items[0].rel_path, "Album X/IMG.jpg");
+        let s = session_for(&f, items);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.status(0), &Status::Skipped);
+    }
+
+    #[test]
+    fn kept_list_write_failure_warns_but_keeps() {
+        let f = fixture(&["a.jpg", "b.jpg"]);
+        // A directory where the kept file should be makes every write fail.
+        fs::create_dir(f.source.join(crate::keptlist::KEPT_FILE_NAME)).unwrap();
+        let mut s = f.session();
+        match s.keep_current() {
+            Message::Warning(msg) => {
+                assert!(msg.starts_with("Couldn't update kept list: "), "{msg}")
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        assert!(matches!(s.status(0), Status::Kept(_)));
+        assert_eq!(s.cursor(), 1);
+        // Undo also warns but still moves the file back.
+        s.prev();
+        match s.skip_current() {
+            Message::Warning(msg) => {
+                assert!(msg.starts_with("Couldn't update kept list: "), "{msg}")
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        assert_eq!(s.status(0), &Status::Skipped);
+        assert!(f.items[0].abs_path.exists());
     }
 
     #[test]

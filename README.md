@@ -47,18 +47,28 @@ keep it.
 
 ## Resuming
 
-Skipped files are listed in `.photo-sorter-skipped.txt` inside the source folder
-(one relative path per line). Kept files have already left the source folder.
-So when you open the same source folder again, the app starts at the first file
-you have not decided on yet. Skipped files are still reachable with ↑. Delete
-the skip-list file to review the skipped files from the start again.
+Two small text files inside the source folder remember your decisions:
+
+- `.photo-sorter-skipped.txt` lists skipped files (one relative path per line).
+- `.photo-sorter-kept.txt` lists kept photos by file name and size (one per
+  line). Kept files have already left the source folder, but Takeout often has
+  other copies of them (see Duplicates); this list stops those copies from
+  coming back.
+
+So when you open the same source folder again, kept photos (and their copies)
+don't appear at all, and the app starts at the first file you have not decided
+on yet. Skipped files are still reachable with ↑. Delete the skip-list file to
+review the skipped files from the start again. Pressing N on a file you kept
+earlier in the same session removes it from the kept list again.
 
 ## Duplicates
 
 Takeout often has the same photo in several places (for example in
 `Photos from 2019` and again in an album folder). Files with the same name and
 the same size are shown only once. The other copies are left untouched in the
-source folder.
+source folder. Once you keep a photo, its other copies are not shown in later
+sessions either, so you won't be asked about it twice or end up with
+`name (1).jpg` copies of the same photo in the keep folder.
 
 ## HEIC photos
 
