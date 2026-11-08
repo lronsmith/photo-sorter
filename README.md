@@ -111,3 +111,8 @@ powershell -ExecutionPolicy Bypass -File tools\make-fixture.ps1 -Path $env:TEMP\
 Choose `<Path>\Takeout` as the source and `<Path>\Keep` as the keep folder. The
 script prints the date each file should get, so you can check the dates in
 Explorer after keeping it.
+
+`-Force` rebuilds the fixture from scratch. It only deletes folders the script
+made itself (they contain a `.photo-sorter-fixture` marker file); if
+`<Path>\Takeout` or `<Path>\Keep` exists without that marker, for example a
+real Takeout export, the script stops with an error and deletes nothing.

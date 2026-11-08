@@ -20,7 +20,9 @@
     Directory to create the fixture in. Created if missing.
 
 .PARAMETER Force
-    Delete an existing <Path>\Takeout and <Path>\Keep first.
+    Delete an existing <Path>\Takeout and <Path>\Keep first. Only folders made
+    by this script (they contain a .photo-sorter-fixture marker file) are ever
+    deleted; any other existing folder stops the script with an error.
 
 .PARAMETER VideoPath
     Use this video file instead of searching C:\Windows.
@@ -46,13 +48,30 @@ $root = [System.IO.Path]::GetFullPath($Path)
 $takeout = Join-Path $root 'Takeout'
 $keep = Join-Path $root 'Keep'
 
+# Every folder this script creates gets this marker. -Force only ever deletes
+# a folder that has it, so it can't wipe a real Takeout export or keep folder.
+$markerName = '.photo-sorter-fixture'
+
+function Stop-WithError([string]$message) {
+    $Host.UI.WriteErrorLine($message)
+    exit 1
+}
+
+# Check both folders before deleting either.
+$toDelete = @()
 foreach ($dir in @($takeout, $keep)) {
     if (Test-Path -LiteralPath $dir) {
         if (-not $Force) {
-            throw "$dir already exists. Re-run with -Force to replace it."
+            Stop-WithError "$dir already exists. Re-run with -Force to replace it (only works on a folder this script made)."
         }
-        Remove-Item -LiteralPath $dir -Recurse -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $dir $markerName) -PathType Leaf)) {
+            Stop-WithError "Refusing to delete $dir`: it has no $markerName marker, so it was not made by this script. Choose a different -Path, or move that folder away yourself."
+        }
+        $toDelete += $dir
     }
+}
+foreach ($dir in $toDelete) {
+    Remove-Item -LiteralPath $dir -Recurse -Force
 }
 
 $photos = Join-Path $takeout 'Google Photos'
@@ -64,6 +83,9 @@ foreach ($dir in @($y2019, $y2018, $album, $keep)) {
 }
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+foreach ($dir in @($takeout, $keep)) {
+    [System.IO.File]::WriteAllText((Join-Path $dir $markerName), "Created by tools\make-fixture.ps1. make-fixture.ps1 -Force may delete this folder.`r`n", $utf8NoBom)
+}
 $summary = New-Object System.Collections.Generic.List[object]
 
 function Write-Text([string]$file, [string]$text) {
@@ -260,4 +282,4 @@ Write-Host "  Keep folder:   $keep (empty)"
 Write-Host ''
 $summary | Sort-Object File | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
 Write-Host 'Not included: a HEIC file (cannot be generated here). Copy one in by hand to test the HEIC preview / Space fallback.'
-Write-Host 'Skip list is written to Takeout\.photo-sorter-skipped.txt; delete it to start over.'
+Write-Host 'Decisions are saved in Takeout\.photo-sorter-skipped.txt and Takeout\.photo-sorter-kept.txt; re-run with -Force to start over.'
