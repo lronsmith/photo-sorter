@@ -1,7 +1,7 @@
 //! The review screen (and the Done screen it ends in): key handling, the
 //! preview cache, and drawing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,6 +21,9 @@ const UNAVAILABLE_VIDEO: &str = "Preview unavailable — press Space to open in 
 const EMPTY_TEXT: &str = "No photos or videos found in this folder";
 /// Previews further than this from the cursor are dropped.
 const KEEP_RADIUS: usize = 2;
+/// Most loader requests outstanding at once. The loader can't cancel, so
+/// this bounds how many decodes the current item can be queued behind.
+const MAX_IN_FLIGHT: usize = 3;
 const WARNING_YELLOW: Color32 = Color32::from_rgb(230, 190, 40);
 
 pub(super) struct Review {
@@ -132,12 +135,9 @@ impl Review {
             }
         }
 
-        // Current first: the loader works through requests in order.
-        let window = [Some(cursor), cursor.checked_add(1), cursor.checked_sub(1)];
-        for idx in window.into_iter().flatten().filter(|&i| i < len) {
-            if self.cache.contains_key(&idx) || self.in_flight.contains_key(&idx) {
-                continue;
-            }
+        let in_flight: HashSet<usize> = self.in_flight.keys().copied().collect();
+        let cached: HashSet<usize> = self.cache.keys().copied().collect();
+        for idx in indices_to_request(cursor, len, &in_flight, &cached) {
             let path = self.session.path_of(idx).to_path_buf();
             let kind = self.session.item(idx).kind;
             self.loader.request(idx, path.clone(), kind);
@@ -231,6 +231,45 @@ impl Review {
     }
 }
 
+/// Which previews to request now, in order. The loader handles requests one
+/// at a time in order and can't cancel them, so:
+/// - at most `MAX_IN_FLIGHT` requests are ever outstanding;
+/// - the cursor comes first, and nothing is requested past it while it
+///   waits for a slot;
+/// - neighbours (next, then previous) are only requested once no request
+///   for an index outside the cursor's ±1 window (e.g. one left behind by a
+///   held ↑/↓) is still outstanding.
+fn indices_to_request(
+    cursor: usize,
+    len: usize,
+    in_flight: &HashSet<usize>,
+    cached: &HashSet<usize>,
+) -> Vec<usize> {
+    let needed = |idx: usize| idx < len && !cached.contains(&idx) && !in_flight.contains(&idx);
+    let mut slots = MAX_IN_FLIGHT.saturating_sub(in_flight.len());
+    let mut out = Vec::new();
+    if needed(cursor) {
+        if slots == 0 {
+            return out;
+        }
+        out.push(cursor);
+        slots -= 1;
+    }
+    if in_flight.iter().any(|idx| idx.abs_diff(cursor) > 1) {
+        return out;
+    }
+    for idx in [cursor.checked_add(1), cursor.checked_sub(1)]
+        .into_iter()
+        .flatten()
+    {
+        if slots > 0 && needed(idx) {
+            out.push(idx);
+            slots -= 1;
+        }
+    }
+    out
+}
+
 fn to_texture(ctx: &egui::Context, idx: usize, img: image::RgbaImage) -> egui::TextureHandle {
     // Previews are capped at MAX_EDGE, but respect a smaller GPU limit too.
     let max_side = ctx.input(|i| i.max_texture_side) as u32;
@@ -285,6 +324,7 @@ fn paint_play_overlay(painter: &egui::Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn fit_rect_preserves_aspect_and_centres() {
@@ -295,5 +335,103 @@ mod tests {
         let tall = fit_rect(Vec2::new(50.0, 100.0), area);
         assert_eq!(tall.size(), Vec2::new(50.0, 100.0));
         assert_eq!(tall.center(), area.center());
+    }
+
+    fn set(items: &[usize]) -> HashSet<usize> {
+        items.iter().copied().collect()
+    }
+
+    fn plan(cursor: usize, len: usize, in_flight: &[usize], cached: &[usize]) -> Vec<usize> {
+        indices_to_request(cursor, len, &set(in_flight), &set(cached))
+    }
+
+    #[test]
+    fn requests_cursor_then_next_then_previous() {
+        assert_eq!(plan(5, 10, &[], &[]), vec![5, 6, 4]);
+    }
+
+    #[test]
+    fn requests_stay_within_the_list() {
+        assert_eq!(plan(0, 10, &[], &[]), vec![0, 1]);
+        assert_eq!(plan(9, 10, &[], &[]), vec![9, 8]);
+        // Done: preload the last item, which ↑ returns to.
+        assert_eq!(plan(3, 3, &[], &[]), vec![2]);
+        assert_eq!(plan(0, 0, &[], &[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn skips_cached_and_in_flight_indices() {
+        assert_eq!(plan(5, 10, &[6], &[5]), vec![4]);
+        assert_eq!(plan(5, 10, &[5, 6], &[4]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn never_more_than_max_in_flight() {
+        // Three stale requests: even the cursor has to wait for a slot.
+        assert_eq!(plan(10, 20, &[1, 2, 3], &[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn no_neighbours_while_stale_requests_are_outstanding() {
+        // The cursor jumps the queue as soon as there's a slot...
+        assert_eq!(plan(10, 20, &[1, 2], &[]), vec![10]);
+        // ...but neighbours wait until the stale work has drained.
+        assert_eq!(plan(10, 20, &[3, 10], &[]), Vec::<usize>::new());
+        // Requests for the ±1 window aren't stale.
+        assert_eq!(plan(10, 20, &[9], &[]), vec![10, 11]);
+    }
+
+    /// Holding ↓ moves the cursor every frame while the loader needs several
+    /// frames per decode. The loader queue must stay bounded, and once the
+    /// key is released the item the user stopped on must load after at most
+    /// `MAX_IN_FLIGHT` decodes.
+    #[test]
+    fn held_key_does_not_build_a_backlog() {
+        const DECODE_FRAMES: usize = 5;
+        const HELD_FRAMES: usize = 60;
+        let len = 1000;
+        let mut cursor = 0;
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        let mut cached: HashSet<usize> = HashSet::new();
+        let mut decodes_after_release = 0;
+        let mut ahead_of_final_cursor = None;
+
+        for frame in 0.. {
+            let holding = frame < HELD_FRAMES;
+            if holding {
+                cursor += 1;
+            }
+            if frame % DECODE_FRAMES == DECODE_FRAMES - 1
+                && let Some(done) = queue.pop_front()
+            {
+                if !holding {
+                    decodes_after_release += 1;
+                }
+                if done.abs_diff(cursor) <= KEEP_RADIUS {
+                    cached.insert(done);
+                }
+            }
+            let in_flight: HashSet<usize> = queue.iter().copied().collect();
+            for idx in indices_to_request(cursor, len, &in_flight, &cached) {
+                if !holding && idx == cursor {
+                    ahead_of_final_cursor = Some(queue.len());
+                }
+                queue.push_back(idx);
+            }
+            cached.retain(|idx| idx.abs_diff(cursor) <= KEEP_RADIUS);
+            assert!(queue.len() <= MAX_IN_FLIGHT, "frame {frame}: {queue:?}");
+
+            if !holding && cached.contains(&cursor) {
+                break;
+            }
+            assert!(frame < 1000, "final item never loaded");
+        }
+        assert!(
+            decodes_after_release <= MAX_IN_FLIGHT,
+            "{decodes_after_release}"
+        );
+        if let Some(ahead) = ahead_of_final_cursor {
+            assert!(ahead < MAX_IN_FLIGHT, "cursor queued behind {ahead}");
+        }
     }
 }
