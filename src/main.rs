@@ -1,15 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-
-#[derive(Default)]
-struct PhotoSorterApp;
-
-impl eframe::App for PhotoSorterApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |_ui| {});
-    }
-}
+use photo_sorter::app::{PhotoSorterApp, install_fallback_fonts};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -21,6 +13,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Photo Sorter",
         options,
-        Box::new(|_cc| Ok(Box::new(PhotoSorterApp))),
+        Box::new(|cc| {
+            install_fallback_fonts(&cc.egui_ctx);
+            Ok(Box::new(PhotoSorterApp::default()))
+        }),
     )
 }

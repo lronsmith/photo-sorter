@@ -1,3 +1,4 @@
+pub mod app;
 pub mod dates;
 pub mod fileops;
 pub mod media;
