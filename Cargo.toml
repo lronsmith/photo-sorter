@@ -2,11 +2,13 @@
 name = "photo-sorter"
 version = "0.1.0"
 edition = "2024"
+# egui/eframe 0.37 need 1.95; this crate on its own needs 1.88 (let-chains).
+rust-version = "1.95"
 
 [dependencies]
 chrono = "0.4.45"
 eframe = "0.37.0"
-image = "0.25.10"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 kamadak-exif = "0.6.2"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -15,3 +17,8 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Shell"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

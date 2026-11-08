@@ -27,7 +27,8 @@ else, who runs it by double-clicking — no Rust, installer, or runtime needed.
 
 ## Technology
 
-- Rust (toolchain updated via `rustup update`; ≥ 1.75 needed for
+- Rust (toolchain updated via `rustup update`; ≥ 1.95, the minimum for
+  egui/eframe 0.37; the crate's own code needs ≥ 1.88 for let-chains and
   `File::set_times` / `FileTimesExt::set_created`).
 - GUI: `eframe` / `egui`.
 - Folder pickers: `rfd` (native Windows dialogs).

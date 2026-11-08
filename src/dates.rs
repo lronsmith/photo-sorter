@@ -3,7 +3,7 @@
 use std::fs::{File, FileTimes, OpenOptions};
 use std::io::BufReader;
 #[cfg(windows)]
-use std::os::windows::fs::FileTimesExt;
+use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,9 @@ use chrono::{NaiveDateTime, TimeZone};
 
 use crate::media::MediaKind;
 use crate::sidecar::{find_sidecar, read_taken_time};
+
+/// Win32 `FILE_WRITE_ATTRIBUTES` access right.
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 
 const EXIF_DATETIME_FORMAT: &str = "%Y:%m:%d %H:%M:%S";
 const DISPLAY_FORMAT: &str = "%-d %b %Y %H:%M";
@@ -82,7 +85,11 @@ pub fn get_times(path: &Path) -> std::io::Result<Times> {
 
 /// Sets a file's creation and last-modified times.
 pub fn set_times(path: &Path, times: Times) -> std::io::Result<()> {
-    let file = OpenOptions::new().write(true).open(path)?;
+    // Only FILE_WRITE_ATTRIBUTES is needed to set times, and unlike write
+    // access it is granted on read-only files.
+    let file = OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(path)?;
     let file_times = FileTimes::new().set_modified(times.modified);
     #[cfg(windows)]
     let file_times = file_times.set_created(times.created);
@@ -159,6 +166,34 @@ mod tests {
             UNIX_EPOCH - Duration::from_secs(86_400)
         );
         assert_eq!(unix_to_system(i64::MIN), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn set_times_works_on_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ro.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms.clone()).unwrap();
+
+        let t = unix_to_system(1552399320);
+        let result = set_times(
+            &file,
+            Times {
+                created: t,
+                modified: t,
+            },
+        );
+        let got = get_times(&file);
+        perms.set_readonly(false);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        result.unwrap();
+        let got = got.unwrap();
+        let secs = |s: SystemTime| s.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(secs(got.created), 1552399320);
+        assert_eq!(secs(got.modified), 1552399320);
     }
 
     #[test]

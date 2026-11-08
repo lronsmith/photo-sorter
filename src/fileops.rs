@@ -75,8 +75,36 @@ fn rename_no_replace(src: &Path, dest: &Path) -> io::Result<()> {
     .map_err(win32_to_io)
 }
 
+/// The path as NUL-terminated UTF-16 for a Win32 call, in verbatim form
+/// (`\\?\C:\...` or `\\?\UNC\server\share\...`) so paths longer than
+/// `MAX_PATH` work. The path is made absolute and normalised first (`/` to
+/// `\`, `.` and `..` resolved), since verbatim paths are taken literally.
+/// Already-verbatim (`\\?\`) and device (`\\.\`) paths are left as they are.
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
+    let wide: Vec<u16> = std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let starts = |prefix: &str| {
+        let prefix: Vec<u16> = prefix.encode_utf16().collect();
+        wide.starts_with(&prefix)
+    };
+    let is_drive_absolute = wide.len() >= 3
+        && wide[1] == u16::from(b':')
+        && wide[2] == u16::from(b'\\')
+        && char::from_u32(u32::from(wide[0])).is_some_and(|c| c.is_ascii_alphabetic());
+    let mut out: Vec<u16> = if starts(r"\\?\") || starts(r"\\.\") {
+        wide
+    } else if starts(r"\\") {
+        r"\\?\UNC\".encode_utf16().chain(wide[2..].iter().copied()).collect()
+    } else if is_drive_absolute {
+        r"\\?\".encode_utf16().chain(wide).collect()
+    } else {
+        wide
+    };
+    out.push(0);
+    out
 }
 
 /// Turns a `HRESULT_FROM_WIN32` error back into an `io::Error` carrying the
@@ -386,6 +414,60 @@ mod tests {
         drop(holder);
         assert_eq!(fs::read(&src).unwrap(), b"photo bytes");
         assert!(!dest.exists());
+    }
+
+    /// A directory under `root` whose path is longer than `MAX_PATH` (260).
+    fn long_dir(root: &Path) -> PathBuf {
+        let mut dir = root.to_path_buf();
+        for i in 0..6 {
+            dir.push(format!("{i}_{}", "d".repeat(48)));
+        }
+        fs::create_dir_all(&dir).unwrap();
+        assert!(dir.as_os_str().len() > 300);
+        dir
+    }
+
+    #[test]
+    fn move_file_handles_paths_over_max_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = long_dir(tmp.path());
+        let src = dir.join("IMG.jpg");
+        let dest = dir.join("IMG moved.jpg");
+        fs::write(&src, b"photo bytes").unwrap();
+        move_file(&src, &dest).unwrap();
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"photo bytes");
+        // Still never overwrites.
+        fs::write(&src, b"other").unwrap();
+        let err = move_file(&src, &dest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&dest).unwrap(), b"photo bytes");
+    }
+
+    #[test]
+    fn keep_and_unkeep_with_long_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = long_dir(&tmp.path().join("takeout"));
+        let keep = tmp.path().join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        let src = dir.join("IMG.jpg");
+        fs::write(&src, b"photo bytes").unwrap();
+        let rec = keep_file(&src, &keep, Some(TAKEN)).unwrap().record;
+        assert_eq!(fs::read(keep.join("IMG.jpg")).unwrap(), b"photo bytes");
+        assert_eq!(unkeep_file(&rec).unwrap(), None);
+        assert_eq!(fs::read(&src).unwrap(), b"photo bytes");
+    }
+
+    #[test]
+    fn verbatim_prefixing() {
+        let w = |s: &str| String::from_utf16(&to_wide(Path::new(s))[..]).unwrap();
+        assert_eq!(w(r"C:\a\b.jpg"), "\\\\?\\C:\\a\\b.jpg\0");
+        assert_eq!(w(r"\\server\share\b.jpg"), "\\\\?\\UNC\\server\\share\\b.jpg\0");
+        assert_eq!(w(r"\\?\C:\a\b.jpg"), "\\\\?\\C:\\a\\b.jpg\0");
+        assert_eq!(w(r"\\?\UNC\s\sh\b.jpg"), "\\\\?\\UNC\\s\\sh\\b.jpg\0");
+        // Normalised first: `/` separators and `..` would not be understood
+        // in a verbatim path.
+        assert_eq!(w("C:/a/x/../b.jpg"), "\\\\?\\C:\\a\\b.jpg\0");
     }
 
     #[test]

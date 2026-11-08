@@ -83,7 +83,8 @@ first frame (where Windows can make a thumbnail); press Space to play one.
 
 ## Building from source
 
-Requires Rust (MSVC toolchain) on Windows.
+Requires Rust 1.95 or newer (MSVC toolchain) on Windows; 1.95 is the minimum
+for the egui/eframe version used.
 
 ```
 rustup update
