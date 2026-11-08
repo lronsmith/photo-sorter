@@ -1,0 +1,58 @@
+name: Release
+
+# Runs only after the CI workflow finishes successfully for a push to main
+# (i.e. a merged PR), and builds the exact commit CI tested.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "v$version-build.$env:RUN_NUMBER"
+
+          Copy-Item target/release/photo-sorter.exe photo-sorter.exe
+          $hash = (Get-FileHash photo-sorter.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  photo-sorter.exe" | Out-File -Encoding ascii -NoNewline photo-sorter.exe.sha256
+
+          gh release create $tag photo-sorter.exe photo-sorter.exe.sha256 `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SHA `
+            --title "Photo Sorter $tag" `
+            --generate-notes `
+            --latest

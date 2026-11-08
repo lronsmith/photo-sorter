@@ -7,7 +7,13 @@ where it is).
 
 ## Download and run
 
-Just `photo-sorter.exe`. Double-click it. Nothing needs to be installed (no
+Download `photo-sorter.exe` from the
+[latest release](https://github.com/lronsmith/photo-sorter/releases/latest)
+(direct link: <https://github.com/lronsmith/photo-sorter/releases/latest/download/photo-sorter.exe>).
+A new release is built automatically each time a change is merged into `main`
+and its tests pass.
+
+Double-click it. Nothing needs to be installed (no
 Rust, no installer, no Visual C++ runtime). Windows SmartScreen may warn about an
 unrecognised app the first time; choose "More info" then "Run anyway".
 
